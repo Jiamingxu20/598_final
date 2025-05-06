@@ -1,0 +1,73 @@
+name: tool_hang_lowdim
+
+obs_dim: 67
+action_dim: 7
+keypoint_dim: 3
+num_agents: 1
+
+obs_keys: &obs_keys [
+  'robot0_eef_pos', 
+  'object', 
+  'robot0_eef_quat', 'robot0_gripper_qpos', 
+]
+task_name: &task_name tool_hang
+dataset_type: &dataset_type ph
+dataset_path: &dataset_path data/robomimic/datasets/${task.task_name}/${task.dataset_type}/low_dim.hdf5
+abs_action: &abs_action False
+
+# Configuration based on robomimic paper
+# Reference: https://arxiv.org/pdf/2108.03298.pdf
+obj_pos_idx: &obj_pos_idx
+  - [0, 3]  # absolute position of the base frame 
+  - [7, 10] # relative position of the base frame with respect to the end effector 
+  - [14, 17] # absolute position of the insertion hook 
+  - [21, 24] # relative position of the insertion hook with respect to the end effector
+  - [28, 31] # absolute position of the ratcheting wrench
+  - [35, 38] # relative position of the ratcheting wrench with respect to the end effector
+
+obj_quat_idx: &obj_quat_idx
+  - [3, 7]  # absolute quaternion of the base frame
+  - [10, 14] # relative quaternion of the base frame with respect to the end effector 
+  - [17, 21] # absolute quaternion of the insertion hook
+  - [24, 28] # relative quaternion of the insertion hook with respect to the end effector
+  - [31, 35] # absolute quaternion of the ratcheting wrench
+  - [38, 42] # relative quaternion of the ratcheting wrench with respect to the end effector
+
+env_runner:
+  _target_: diffusion_policy.env_runner.robomimic_lowdim_runner.RobomimicLowdimRunner
+  dataset_path: *dataset_path
+  obs_keys: *obs_keys
+  obj_pos_idx: *obj_pos_idx
+  obj_quat_idx: *obj_quat_idx
+  n_train: 6
+  n_train_vis: 2
+  train_start_idx: 0
+  n_test: 50
+  n_test_vis: 4
+  test_start_seed: 100000
+  max_steps: 700
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  n_latency_steps: ${n_latency_steps}
+  render_hw: [128,128]
+  fps: 10
+  crf: 22
+  past_action: ${past_action_visible}
+  abs_action: *abs_action
+  n_envs: 28
+# seed 42 will crash MuJoCo for some reason.
+  visualize_state_denoising: False
+
+dataset:
+  _target_: diffusion_policy.dataset.robomimic_replay_lowdim_dataset.RobomimicReplayLowdimDataset
+  dataset_path: *dataset_path
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  obs_keys: *obs_keys
+  abs_action: *abs_action
+  obj_pos_idx: *obj_pos_idx
+  obj_quat_idx: *obj_quat_idx
+  use_legacy_normalizer: False
+  seed: 42
+  val_ratio: 0.02

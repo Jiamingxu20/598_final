@@ -1,0 +1,512 @@
+from __future__ import print_function
+import gym
+from gym import spaces
+
+import collections
+import numpy as np
+import pygame
+import pymunk
+import pymunk.pygame_util
+from pymunk.vec2d import Vec2d
+import shapely.geometry as sg
+import cv2
+import skimage.transform as st
+from diffusion_policy.env.pusht.pymunk_override import DrawOptions
+# from diffusion_policy.devices.spacemouse import SpaceMouse
+
+
+def pymunk_to_shapely(body, shapes):
+    geoms = list()
+    for shape in shapes:
+        if isinstance(shape, pymunk.shapes.Poly):
+            verts = [body.local_to_world(v) for v in shape.get_vertices()]
+            verts += [verts[0]]
+            geoms.append(sg.Polygon(verts))
+        else:
+            raise RuntimeError(f'Unsupported shape type {type(shape)}')
+    geom = sg.MultiPolygon(geoms)
+    return geom
+
+class PushLAsymEnv(gym.Env):
+    metadata = {"render.modes": ["human", "rgb_array"], "video.frames_per_second": 10}
+    reward_range = (0., 1.)
+
+    def __init__(self,
+            legacy=False, 
+            block_cog=None, damping=None,
+            render_action=True,
+            render_size=96,
+            reset_to_state=None
+        ):
+        self._seed = None
+        self.seed()
+        self.window_size = ws = 512  # The size of the PyGame window
+        self.render_size = render_size
+        self.sim_hz = 100
+        # Local controller params.
+        self.k_p, self.k_v = 100, 20    # PD control.z
+        self.control_hz = self.metadata['video.frames_per_second']
+        # legcay set_state for data compatibility
+        self.legacy = legacy
+
+        # agent_pos, block_pos, block_angle, U_object_pos, U_object_angle
+        self.observation_space = spaces.Box(
+            low=np.array([0,0,0,0,0,0,0,0], dtype=np.float64),
+            high=np.array([ws,ws,ws,ws,np.pi*2,ws,ws,np.pi*2], dtype=np.float64),
+            shape=(8,),
+            dtype=np.float64
+        )
+
+        # positional goal for agent
+        self.action_space = spaces.Box(
+            low=np.array([0,0], dtype=np.float64),
+            high=np.array([ws,ws], dtype=np.float64),
+            shape=(2,),
+            dtype=np.float64
+        )
+
+        self.block_cog = block_cog
+        self.damping = damping
+        self.render_action = render_action
+
+        """
+        If human-rendering is used, `self.window` will be a reference
+        to the window that we draw to. `self.clock` will be a clock that is used
+        to ensure that the environment is rendered at the correct framerate in
+        human-mode. They will remain `None` until human-mode is used for the
+        first time.
+        """
+        self.window = None
+        self.clock = None
+        self.screen = None
+
+        self.space = None
+        self.teleop = None
+        self.render_buffer = None
+        self.latest_action = None
+        self.reset_to_state = reset_to_state
+
+        self.done = False
+
+
+
+    def reset(self):
+        seed = self._seed
+        self._setup()
+        if self.block_cog is not None:
+            self.L0_object.center_of_gravity = self.block_cog
+        if self.damping is not None:
+            self.space.damping = self.damping
+        
+        # use legacy RandomState for compatibility
+        state = self.reset_to_state
+        if state is None:
+            rs = np.random.RandomState(seed=seed)
+            state = np.array([
+                rs.randint(50, 450), rs.randint(50, 450),
+                rs.randint(100, 400), rs.randint(100, 400),
+                rs.randn() * 2 * np.pi - np.pi,
+                rs.randint(100, 400), rs.randint(100, 400),
+                rs.randn() * 2 * np.pi - np.pi,
+                ])
+        self._set_state(state)
+
+        observation = self._get_obs()
+        return observation
+
+    def step(self, action):
+        dt = 1.0 / self.sim_hz
+        self.n_contact_points = 0
+        n_steps = self.sim_hz // self.control_hz
+        if action is not None:
+            self.latest_action = action
+            for i in range(n_steps):
+                # Step PD control.
+                # self.agent.velocity = self.k_p * (act - self.agent.position)    # P control works too.
+                acceleration = self.k_p * (action - self.agent.position) + self.k_v * (Vec2d(0, 0) - self.agent.velocity)
+                self.agent.velocity += acceleration * dt
+
+                # Step physics.
+                self.space.step(dt)
+
+        # compute reward
+        L0_goal_body = self._get_goal_pose_body(self.L0_goal_pose)
+        L0_goal_geom = pymunk_to_shapely(L0_goal_body, self.L0_object.shapes)
+
+        L1_goal_body = self._get_goal_pose_body(self.L1_goal_pose)
+        L1_goal_geom = pymunk_to_shapely(L1_goal_body, self.L1_object.shapes)
+
+        L0_object_geom = pymunk_to_shapely(self.L0_object, self.L0_object.shapes)
+        L1_object_geom = pymunk_to_shapely(self.L1_object, self.L1_object.shapes)
+
+        L0_object_intersection_area = L0_goal_geom.intersection(L0_object_geom).area
+        L1_object_intersection_area = L1_goal_geom.intersection(L1_object_geom).area
+
+        # L0_goal_area = L0_goal_geom.area
+        # L1_goal_area = L1_goal_geom.area
+
+        # L0_object_coverage = L0_object_intersection_area / L0_goal_area
+        # L1_object_coverage = L1_object_intersection_area / L1_goal_area
+
+
+        L0_object_on_L0_goal = L0_goal_geom.intersection(L0_object_geom).area / L0_goal_geom.area
+        L1_object_on_L1_goal = L1_goal_geom.intersection(L1_object_geom).area / L1_goal_geom.area
+        L1_object_on_L0_goal = L0_goal_geom.intersection(L1_object_geom).area / L0_goal_geom.area
+        L0_object_on_L1_goal = L1_goal_geom.intersection(L0_object_geom).area / L1_goal_geom.area
+
+        # Combine all four coverage percentages to calculate the reward
+        total_coverage = (L0_object_on_L0_goal + L1_object_on_L1_goal + L1_object_on_L0_goal + L0_object_on_L1_goal)
+        reward = np.clip(total_coverage / (2 * self.success_threshold), 0, 1)
+
+        # If any of the objects are on their respective goals, we're done.
+        self.done = (L0_object_on_L0_goal > self.success_threshold and L1_object_on_L1_goal > self.success_threshold) \
+                    or (L0_object_on_L1_goal > self.success_threshold and L1_object_on_L0_goal > self.success_threshold)
+
+        # reward = np.clip((L0_object_coverage + L1_object_coverage) / (2 * self.success_threshold), 0, 1)
+        # self.done = (L0_object_coverage > self.success_threshold) and (L1_object_coverage > self.success_threshold)
+
+        observation = self._get_obs()
+        info = self._get_info()
+        # print("observation: ", observation)
+        # print("self._get_obs(): ", self._get_obs())
+        return observation, reward, self.done, info
+
+    def render(self, mode):
+        return self._render_frame(mode)
+
+    def teleop_agent(self):
+        TeleopAgent = collections.namedtuple('TeleopAgent', ['act'])
+        def act(obs):
+            act = None
+            mouse_position = pymunk.pygame_util.from_pygame(Vec2d(*pygame.mouse.get_pos()), self.screen)
+            if self.teleop or (mouse_position - self.agent.position).length < 30:
+                self.teleop = True
+                act = mouse_position
+            return act
+        return TeleopAgent(act)
+    
+
+
+
+    def teleop_agent_spacemouse(self):
+        # global mouse_positionx, mouse_positiony
+        TeleopAgent = collections.namedtuple('TeleopAgent', ['act'])
+        device0 = SpaceMouse(pos_sensitivity=3.0, rot_sensitivity=3.0)
+        device0.start_control()
+
+        def act(obs):
+            act = None
+            # mouse_position = pymunk.pygame_util.from_pygame(Vec2d(*pygame.mouse.get_pos()), self.screen)
+            
+            state0 = device0.get_controller_state()
+            dpos0, rotation0, raw_drotation0, grasp0, reset0 = (
+            state0["dpos"],
+            state0["rotation"],
+            state0["raw_drotation"],
+            state0["grasp"],
+            state0["reset"],
+            )
+            # print("dpos0: ")
+            # print(dpos0)
+            # print("dpos0[0]: ")
+            # print(dpos0[0])
+
+            mouse_positionx = dpos0[1]*60
+            mouse_positiony = dpos0[0]*60
+            mouse_position = (mouse_positionx, mouse_positiony)
+            if self.teleop or (mouse_position - self.agent.position).length < 300:
+                self.teleop = True
+                act = mouse_position
+                # print("mouse_position: ")
+                # print(mouse_position)
+                # print(mouse_position.type())
+            return act
+        return TeleopAgent(act)
+
+
+
+
+    def _get_obs(self):
+        obs = np.array(
+            tuple(self.agent.position) \
+            + tuple(self.L0_object.position) \
+            + tuple(self.L1_object.position) \
+            + (self.L0_object.angle % (2 * np.pi),)
+            + (self.L1_object.angle % (2 * np.pi),))
+        return obs
+
+    def _get_goal_pose_body(self, pose):
+        mass = 1
+        inertia = pymunk.moment_for_box(mass, (50, 100))
+        body = pymunk.Body(mass, inertia)
+        # preserving the legacy assignment order for compatibility
+        # the order here doesn't matter somehow, maybe because CoM is aligned with body origin
+        body.position = pose[:2].tolist()
+        body.angle = pose[2]
+        return body
+    
+    def _get_info(self):
+        n_steps = self.sim_hz // self.control_hz
+        n_contact_points_per_step = int(np.ceil(self.n_contact_points / n_steps))
+        info = {
+            'pos_agent': np.array(self.agent.position),
+            'vel_agent': np.array(self.agent.velocity),
+            'L0_object_pose': np.array(list(self.L0_object.position) + [self.L0_object.angle]),
+            'L1_object_pose': np.array(list(self.L1_object.position) + [self.L1_object.angle]),
+            'L0_goal_pose': self.L0_goal_pose,
+            'L1_goal_pose': self.L1_goal_pose,
+            'n_contacts': n_contact_points_per_step,
+            'success': self.done}
+        return info
+
+    def _render_frame(self, mode):
+
+        if self.window is None and mode == "human":
+            pygame.init()
+            pygame.display.init()
+            self.window = pygame.display.set_mode((self.window_size, self.window_size))
+        if self.clock is None and mode == "human":
+            self.clock = pygame.time.Clock()
+
+        canvas = pygame.Surface((self.window_size, self.window_size))
+        canvas.fill((255, 255, 255))
+        self.screen = canvas
+
+        draw_options = DrawOptions(canvas)
+
+        # Draw goal pose.
+        goal_body = self._get_goal_pose_body(self.L0_goal_pose)
+        for shape in self.L0_object.shapes:
+            goal_points = [pymunk.pygame_util.to_pygame(goal_body.local_to_world(v), draw_options.surface) for v in shape.get_vertices()]
+            goal_points += [goal_points[0]]
+            pygame.draw.polygon(canvas, self.goal_color, goal_points)
+
+        goal_body = self._get_goal_pose_body(self.L1_goal_pose)
+        for shape in self.L1_object.shapes:
+            goal_points = [pymunk.pygame_util.to_pygame(goal_body.local_to_world(v), draw_options.surface) for v in shape.get_vertices()]
+            goal_points += [goal_points[0]]
+            pygame.draw.polygon(canvas, self.goal_color, goal_points)
+
+        # Draw agent and block.
+        self.space.debug_draw(draw_options)
+
+        if mode == "human":
+            # The following line copies our drawings from `canvas` to the visible window
+            self.window.blit(canvas, canvas.get_rect())
+            pygame.event.pump()
+            pygame.display.update()
+
+            # the clock is already ticked during in step for "human"
+
+
+        img = np.transpose(
+                np.array(pygame.surfarray.pixels3d(canvas)), axes=(1, 0, 2)
+            )
+        img = cv2.resize(img, (self.render_size, self.render_size))
+        if self.render_action:
+            if self.render_action and (self.latest_action is not None):
+                action = np.array(self.latest_action)
+                coord = (action / 512 * 96).astype(np.int32)
+                marker_size = int(8/96*self.render_size)
+                thickness = int(1/96*self.render_size)
+                cv2.drawMarker(img, coord,
+                    color=(255,0,0), markerType=cv2.MARKER_CROSS,
+                    markerSize=marker_size, thickness=thickness)
+        return img
+
+
+    def close(self):
+        if self.window is not None:
+            pygame.display.quit()
+            pygame.quit()
+    
+    def seed(self, seed=None):
+        if seed is None:
+            seed = np.random.randint(0,25536)
+        self._seed = seed
+        self.np_random = np.random.default_rng(seed)
+
+    def _handle_collision(self, arbiter, space, data):
+        self.n_contact_points += len(arbiter.contact_point_set.points)
+
+    def _set_state(self, state):
+        if isinstance(state, np.ndarray):
+            state = state.tolist()
+        pos_agent = state[:2]
+        pos_L0 = state[2:4]
+        rot_L0 = state[4]
+        pos_L1 = state[5:7]
+        rot_L1 = state[7]
+        self.agent.position = pos_agent
+        # setting angle rotates with respect to center of mass
+        # therefore will modify the geometric position
+        # if not the same as CoM
+        # therefore should be modified first.
+        if self.legacy:
+            # for compatibility with legacy data
+            self.L0_object.position = pos_L0
+            self.L0_object.angle = rot_L0
+            self.L1_object.position = pos_L1
+            self.L1_object.angle = rot_L1
+        else:
+            self.L0_object.angle = rot_L0
+            self.L0_object.position = pos_L0
+            self.L1_object.angle = rot_L1
+            self.L1_object.position = pos_L1
+
+        # Run physics to take effect
+        self.space.step(1.0 / self.sim_hz)
+    
+    def _set_state_local(self, state_local):
+        agent_pos_local = state_local[:2]
+        block_pose_local = state_local[2:]
+        tf_img_obj = st.AffineTransform(
+            translation=self.goal_pose[:2], 
+            rotation=self.goal_pose[2])
+        tf_obj_new = st.AffineTransform(
+            translation=block_pose_local[:2],
+            rotation=block_pose_local[2]
+        )
+        tf_img_new = st.AffineTransform(
+            matrix=tf_img_obj.params @ tf_obj_new.params
+        )
+        agent_pos_new = tf_img_new(agent_pos_local)
+        new_state = np.array(
+            list(agent_pos_new[0]) + list(tf_img_new.translation) \
+                + [tf_img_new.rotation])
+        self._set_state(new_state)
+        return new_state
+
+    def _setup(self):
+        self.space = pymunk.Space()
+        self.space.gravity = 0, 0
+        self.space.damping = 0
+        self.teleop = False
+        self.render_buffer = list()
+        
+        # Add walls.
+        walls = [
+            self._add_segment((5, 506), (5, 5), 2),
+            self._add_segment((5, 5), (506, 5), 2),
+            self._add_segment((506, 5), (506, 506), 2),
+            self._add_segment((5, 506), (506, 506), 2)
+        ]
+        self.space.add(*walls)
+
+        # Add agent, block, and goal zone.
+        self.agent = self.add_circle((256, 400), 15)
+
+        self.L0_object = self.add_L0((256, 300), 0)
+        self.goal_color = pygame.Color('LightGreen')
+        self.L0_goal_pose = np.array([300,200,np.pi/4])  # x, y, theta (in radians)
+
+        self.L1_object = self.add_L1((200, 200), 0)
+        L1_goal_pos = (self.L0_goal_pose[:2].copy())
+        goal_distance = 64
+        L1_goal_pos[0] -= goal_distance
+        L1_goal_pos[1] += goal_distance
+        self.L1_goal_pose = np.array([*L1_goal_pos,np.pi*5/4])  # x, y, theta (in radians)
+
+        # Add collision handling
+        self.collision_handeler = self.space.add_collision_handler(0, 0)
+        self.collision_handeler.post_solve = self._handle_collision
+        self.n_contact_points = 0
+
+        self.max_score = 50 * 100
+        self.success_threshold = 0.9    # 95% coverage.
+
+
+    def _add_segment(self, a, b, radius):
+        shape = pymunk.Segment(self.space.static_body, a, b, radius)
+        shape.color = pygame.Color('LightGray')    # https://htmlcolorcodes.com/color-names
+        return shape
+
+    def add_circle(self, position, radius):
+        body = pymunk.Body(body_type=pymunk.Body.KINEMATIC)
+        body.position = position
+        body.friction = 1
+        shape = pymunk.Circle(body, radius)
+        shape.color = pygame.Color('RoyalBlue')
+        self.space.add(body, shape)
+        return body
+
+    def add_box(self, position, height, width):
+        mass = 1
+        inertia = pymunk.moment_for_box(mass, (height, width))
+        body = pymunk.Body(mass, inertia)
+        body.position = position
+        shape = pymunk.Poly.create_box(body, (height, width))
+        shape.color = pygame.Color('LightSlateGray')
+        self.space.add(body, shape)
+        return body
+
+    def add_L0(self, position, angle, scale=30, color='LightSlateGray', mask=pymunk.ShapeFilter.ALL_MASKS()):
+        mass = 1
+        length = 4
+        # Define the vertices for the L shape
+        vertices1 = [(-length*scale/2, scale),
+                     ( length*scale/2, scale),
+                     ( length*scale/2, 0),
+                     (-length*scale/2, 0)]
+        inertia1 = pymunk.moment_for_poly(mass, vertices=vertices1)
+        
+        vertices2 = [(0, scale),
+                     (0, length*2/4*scale),
+                     ( length*scale/2, length*2/4*scale),
+                     ( length*scale/2, scale)]
+        
+        inertia2 = pymunk.moment_for_poly(mass, vertices=vertices2)
+        
+        body = pymunk.Body(mass, inertia1 + inertia2)
+        shape1 = pymunk.Poly(body, vertices1)
+        shape2 = pymunk.Poly(body, vertices2)
+        
+        shape1.color = pygame.Color(color)
+        shape2.color = pygame.Color(color)
+        
+        shape1.filter = pymunk.ShapeFilter(mask=mask)
+        shape2.filter = pymunk.ShapeFilter(mask=mask)
+        
+        body.center_of_gravity = (shape1.center_of_gravity + shape2.center_of_gravity) / 2
+        body.position = position
+        body.angle = angle
+        body.friction = 1
+        self.space.add(body, shape1, shape2)
+        
+        return body
+
+
+    def add_L1(self, position, angle, scale=30, color='LightSlateGray', mask=pymunk.ShapeFilter.ALL_MASKS()):
+        mass = 1
+        length = 4
+        # Define the vertices for the L shape
+        vertices1 = [(-length*scale*3/4, scale),
+                     ( length*scale*2/4, scale),
+                     ( length*scale*2/4, 0),
+                     (-length*scale*3/4, 0)]
+        inertia1 = pymunk.moment_for_poly(mass, vertices=vertices1)
+        
+        vertices2 = [(0, scale),
+                     (0, length*2/4*scale),
+                     ( length*scale/2, length*2/4*scale),
+                     ( length*scale/2, scale)]
+        
+        inertia2 = pymunk.moment_for_poly(mass, vertices=vertices2)
+        
+        body = pymunk.Body(mass, inertia1 + inertia2)
+        shape1 = pymunk.Poly(body, vertices1)
+        shape2 = pymunk.Poly(body, vertices2)
+        
+        shape1.color = pygame.Color(color)
+        shape2.color = pygame.Color(color)
+        
+        shape1.filter = pymunk.ShapeFilter(mask=mask)
+        shape2.filter = pymunk.ShapeFilter(mask=mask)
+        
+        body.center_of_gravity = (shape1.center_of_gravity + shape2.center_of_gravity) / 2
+        body.position = position
+        body.angle = angle
+        body.friction = 1
+        self.space.add(body, shape1, shape2)
+        
+        return body

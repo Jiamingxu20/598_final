@@ -1,0 +1,104 @@
+name: real_cake_traj_pcd
+
+image_shape: [3, 96, 128] # [channel, height, width]
+depth_shape: [480, 640] # [height, width]
+pcd_shape: [6, 2000] # [channel:(x,y,z,r,g,b), number of points]
+dataset_path: data/real_cake_scooping_no_rep
+
+action_bound:
+  x_lower: None
+  x_upper: None
+  y_lower: None
+  y_upper: None
+  z_lower: 0.18245
+  z_upper: None
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    camera_0_color:
+      shape: ${task.image_shape}
+      type: rgb
+    # camera_0_depth:
+    #   shape: ${task.depth_shape}
+    #   type: depth
+    # camera_1:
+    #   shape: ${task.image_shape}
+    #   type: rgb
+    # camera_1_depth:
+    #   shape: ${task.depth_shape}
+    #   type: depth
+    # camera_2:
+    #   shape: ${task.image_shape}
+    #   type: rgb
+    # camera_2_depth:
+    #   shape: ${task.depth_shape}
+    #   type: depth
+    # camera_3:
+    #   shape: ${task.image_shape}
+    #   type: rgb
+    # camera_3_depth:
+    #   shape: ${task.depth_shape}
+    #   type: depth
+    point_cloud:
+      shape: ${task.pcd_shape}
+      type: spatial
+      info:
+        view_keys:
+          - camera_0
+          - camera_1
+          - camera_2
+          - camera_3
+          - camera_4
+        boundaries:
+          x_lower: -0.08
+          x_upper: 0.29
+          y_lower: -0.30
+          y_upper: 0.15
+          z_lower: 0.18
+          z_upper: 0.35
+        reference_frame: robot
+        resize_ratio: 0.5
+        voxel_size: 0.01
+        right_tool: kinfe
+        rob_pcd: false
+        N_joints: null
+        N_per_link: 50
+        eef_pcd: true
+        N_eef: 100 
+    # robot_joint:
+    #   shape: [6]
+    #   type: low_dim
+    robot_eef_pose:
+      shape: [9]
+      type: low_dim
+    robot_ft_wrench:
+      shape: [6]
+      type: low_dim
+
+  action:
+    shape: [9]
+    type: cartesian_action  # cartesian_action or joint_action
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pcd_runner.RealPcdRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.real_pcd_dataset.RealPcdDataset
+  shape_meta: *shape_meta  
+  dataset_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1+${n_latency_steps}'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  n_latency_steps: ${n_latency_steps}
+  use_cache: True
+  seed: 42
+  val_ratio: 0.1
+  max_train_episodes: null
+  delta_action: False
+  # debug: ${debug}
+  debug_overfit: False
+  use_robomimic_legacy_normalizer: True
+
+
